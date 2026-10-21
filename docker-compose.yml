@@ -1,0 +1,17 @@
+# Ek command me pura app (frontend + backend) Docker me chalao:
+#   docker compose up --build
+# Phir browser me kholo: http://localhost:8080
+services:
+  backend:
+    build: ./backend
+    environment:
+      - APP_VERSION=compose
+    ports:
+      - "5000:5000"
+
+  frontend:
+    build: ./frontend
+    ports:
+      - "8080:80"
+    depends_on:
+      - backend

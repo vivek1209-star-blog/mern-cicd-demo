@@ -1,0 +1,149 @@
+# =====================================================================
+#  CI/CD Pipeline  (tumhare screenshot wala pura flow)
+#
+#  PR banaya      -> sirf CI (build + test + check). Fail = STOP ❌
+#  main pe merge  -> CI -> Docker image -> Docker Hub -> Staging -> (approve) -> Production
+#
+#  GitHub repo > Settings > Secrets and variables > Actions me ye daalo:
+#    DOCKERHUB_USERNAME   = tumhara Docker Hub username
+#    DOCKERHUB_TOKEN      = Docker Hub > Account Settings > Personal access tokens
+#    KUBE_CONFIG          = (optional) Kubernetes cluster ki kubeconfig file (base64)
+# =====================================================================
+name: CI-CD Pipeline
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  workflow_dispatch: # Actions tab se manually "Run workflow" button
+
+env:
+  BACKEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/cicd-demo-backend
+  FRONTEND_IMAGE: ${{ secrets.DOCKERHUB_USERNAME }}/cicd-demo-frontend
+
+jobs:
+  # ---------------- 1. CI : Build + Test + Check ----------------
+  ci:
+    name: "CI · Build, Test, Check"
+    runs-on: ubuntu-latest
+    steps:
+      - name: 📥 Code download karo
+        uses: actions/checkout@v4
+
+      - name: 🟢 Node setup
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: 🧪 Backend install + test
+        working-directory: backend
+        run: |
+          npm install
+          npm test
+
+      - name: 🏗️ Frontend install + build
+        working-directory: frontend
+        run: |
+          npm install
+          npm run build
+
+  # ---------------- 2. Docker Image -> Docker Hub ----------------
+  docker:
+    name: "Docker · Build & Push"
+    needs: ci # CI pass hua tabhi ye chalega
+    if: github.event_name != 'pull_request' # PR pe image push nahi karte
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 🔐 Docker Hub login
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: 🐳 Backend image build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./backend
+          push: true
+          tags: |
+            ${{ env.BACKEND_IMAGE }}:latest
+            ${{ env.BACKEND_IMAGE }}:${{ github.sha }}
+
+      - name: 🐳 Frontend image build + push
+        uses: docker/build-push-action@v6
+        with:
+          context: ./frontend
+          push: true
+          tags: |
+            ${{ env.FRONTEND_IMAGE }}:latest
+            ${{ env.FRONTEND_IMAGE }}:${{ github.sha }}
+
+  # ---------------- 3. CD : Staging (Kubernetes) ----------------
+  deploy-staging:
+    name: "CD · Deploy to Staging"
+    needs: docker
+    runs-on: ubuntu-latest
+    environment: staging
+    env:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ☸️ kubectl setup
+        if: env.KUBE_CONFIG != ''
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+
+      - name: 🚀 Deploy to staging namespace
+        if: env.KUBE_CONFIG != ''
+        run: |
+          kubectl create namespace staging --dry-run=client -o yaml | kubectl apply -f -
+          sed "s|DOCKERHUB_USER|${{ secrets.DOCKERHUB_USERNAME }}|g; s|IMAGE_TAG|${{ github.sha }}|g" k8s/app.yaml \
+            | kubectl apply -n staging -f -
+          kubectl rollout status deployment/backend -n staging --timeout=120s
+
+      - name: ℹ️ Cluster nahi hai?
+        if: env.KUBE_CONFIG == ''
+        run: echo "KUBE_CONFIG secret set nahi hai, isliye deploy skip. Image Docker Hub pe ready hai ✅"
+
+  # ---------------- 4. CD : Production (Manual Approval) ----------------
+  # GitHub > Settings > Environments > "production" > Required reviewers ON
+  #   => Continuous DELIVERY (insaan approve karega)
+  # Required reviewers OFF => Continuous DEPLOYMENT (sab automatic)
+  deploy-production:
+    name: "CD · Deploy to Production"
+    needs: deploy-staging
+    runs-on: ubuntu-latest
+    environment: production
+    env:
+      KUBE_CONFIG: ${{ secrets.KUBE_CONFIG }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: ☸️ kubectl setup
+        if: env.KUBE_CONFIG != ''
+        run: |
+          mkdir -p ~/.kube
+          echo "$KUBE_CONFIG" | base64 -d > ~/.kube/config
+
+      - name: 🚀 Deploy to production
+        if: env.KUBE_CONFIG != ''
+        run: |
+          kubectl create namespace production --dry-run=client -o yaml | kubectl apply -f -
+          sed "s|DOCKERHUB_USER|${{ secrets.DOCKERHUB_USERNAME }}|g; s|IMAGE_TAG|${{ github.sha }}|g" k8s/app.yaml \
+            | kubectl apply -n production -f -
+          # Naya version fail hua to automatic purana wapas (rollback)
+          if ! kubectl rollout status deployment/backend -n production --timeout=120s; then
+            echo "❌ Deploy fail! Rollback kar rahe hain..."
+            kubectl rollout undo deployment/backend -n production
+            kubectl rollout undo deployment/frontend -n production
+            exit 1
+          fi
+
+      - name: ℹ️ Cluster nahi hai?
+        if: env.KUBE_CONFIG == ''
+        run: echo "KUBE_CONFIG secret set nahi hai, isliye deploy skip."
